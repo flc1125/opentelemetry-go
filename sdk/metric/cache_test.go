@@ -59,3 +59,17 @@ func TestCacheConcurrentSafe(t *testing.T) {
 		assert.Fail(t, "timeout")
 	}
 }
+
+func BenchmarkCacheHasKey(b *testing.B) {
+	b.ReportAllocs()
+
+	c := cache[string, int]{}
+	c.Lookup("key", func() int { return 42 })
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.HasKey("key")
+		}
+	})
+}
