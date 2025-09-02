@@ -285,6 +285,8 @@ func (p *TracerProvider) UnregisterSpanProcessor(sp SpanProcessor) {
 // ForceFlush immediately exports all spans that have not yet been exported for
 // all the registered span processors.
 func (p *TracerProvider) ForceFlush(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	spss := p.getSpanProcessors()
 	if len(spss) == 0 {
 		return nil
