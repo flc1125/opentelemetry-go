@@ -287,6 +287,7 @@ func (p *TracerProvider) UnregisterSpanProcessor(sp SpanProcessor) {
 func (p *TracerProvider) ForceFlush(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	spss := p.getSpanProcessors()
 	if len(spss) == 0 {
 		return nil
