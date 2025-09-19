@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/mock"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc/internal"
 
 	"github.com/google/go-cmp/cmp"
@@ -1077,4 +1078,145 @@ func BenchmarkExporterExportLogs(b *testing.B) {
 	b.Run("NoObservability", func(b *testing.B) {
 		run(b, false)
 	})
+}
+
+type mockLogsServiceClient struct {
+	collogpb.LogsServiceClient
+
+	mock.Mock
+}
+
+func (m *mockLogsServiceClient) Export(ctx context.Context, in *collogpb.ExportLogsServiceRequest, opts ...grpc.CallOption) (*collogpb.ExportLogsServiceResponse, error) {
+	args := m.Called(ctx, in, opts)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*collogpb.ExportLogsServiceResponse), args.Error(1)
+}
+
+func TestPR7353UploadLogs(t *testing.T) {
+	runTestUploadLogs := func(t *testing.T, uploadLogsNum int, mockOnFunc func(m *mockLogsServiceClient), assertExportedValue int64) {
+		t.Helper()
+		t.Setenv("OTEL_GO_X_OBSERVABILITY", "true")
+
+		prev := otel.GetMeterProvider()
+		defer func() {
+			otel.SetMeterProvider(prev)
+		}()
+
+		r := metric.NewManualReader()
+		mp := metric.NewMeterProvider(metric.WithReader(r))
+		otel.SetMeterProvider(mp)
+
+		mockSvcClient := new(mockLogsServiceClient)
+		mockOnFunc(mockSvcClient)
+
+		c, err := newClient(newConfig([]Option{}))
+		require.NoError(t, err)
+		c.lsc = mockSvcClient
+
+		require.Len(t, resourceLogs, 1)
+
+		// fill the buffer with resourceLogsNum ResourceLogs
+		fillResourceLogs := make([]*lpb.ResourceLogs, 0, uploadLogsNum)
+		for i := 0; i < uploadLogsNum; i++ {
+			fillResourceLogs = append(fillResourceLogs, resourceLogs[0])
+		}
+		require.Len(t, fillResourceLogs, uploadLogsNum)
+
+		_ = c.UploadLogs(t.Context(), fillResourceLogs)
+
+		var rm metricdata.ResourceMetrics
+		err = r.Collect(t.Context(), &rm)
+		require.NoError(t, err)
+		require.NotEmpty(t, rm.ScopeMetrics)
+		require.NotEmpty(t, rm.ScopeMetrics[0].Metrics)
+
+		t.Logf("len of metrics: %d", len(rm.ScopeMetrics[0].Metrics))
+
+		var seek bool
+		for _, m := range rm.ScopeMetrics[0].Metrics {
+			if m.Name == (otelconv.SDKExporterLogExported{}).Name() {
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				require.NotEmpty(t, sum.DataPoints)
+				assert.Equal(t, assertExportedValue, sum.DataPoints[0].Value)
+				seek = true
+			}
+		}
+		require.True(t, seek, "Cannot find exported logs metric")
+
+		mockSvcClient.AssertExpectations(t)
+	}
+
+	tests := []struct {
+		name                string
+		uploadLogsNum       int
+		mockOnFunc          func(m *mockLogsServiceClient)
+		assertExportedValue int64
+	}{
+		{
+			name:          "ExportLogsServiceResponse with PartialSuccess nil",
+			uploadLogsNum: 10,
+			mockOnFunc: func(m *mockLogsServiceClient) {
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(&collogpb.ExportLogsServiceResponse{
+					PartialSuccess: nil,
+				}, nil)
+			},
+			assertExportedValue: 10,
+		},
+		{
+			name:          "ExportLogsServiceResponse with PartialSuccess and 3 rejected logs",
+			uploadLogsNum: 10,
+			mockOnFunc: func(m *mockLogsServiceClient) {
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(&collogpb.ExportLogsServiceResponse{
+					PartialSuccess: &collogpb.ExportLogsPartialSuccess{
+						RejectedLogRecords: 3,
+					},
+				}, nil)
+			},
+			assertExportedValue: 7,
+		},
+		{
+			name:          "ExportLogsServiceResponse with nil and Unavailable error",
+			uploadLogsNum: 10,
+			mockOnFunc: func(m *mockLogsServiceClient) {
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(nil, status.Errorf(codes.Unavailable, "server unavailable"))
+			},
+			assertExportedValue: 0,
+		},
+		{
+			name:          "ExportLogsServiceResponse with PartialSuccess and 3 rejected logs and Unavailable error",
+			uploadLogsNum: 10,
+			mockOnFunc: func(m *mockLogsServiceClient) {
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(nil, status.Errorf(codes.Unavailable, "server unavailable")).Once()
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(&collogpb.ExportLogsServiceResponse{
+					PartialSuccess: &collogpb.ExportLogsPartialSuccess{
+						RejectedLogRecords: 3,
+					},
+				}, nil)
+			},
+			assertExportedValue: 7,
+		},
+		{
+			name:          "ExportLogsServiceResponse with PartialSuccess and 3 rejected logs and InvalidArgument error",
+			uploadLogsNum: 10,
+			mockOnFunc: func(m *mockLogsServiceClient) {
+				m.On("Export", mock.Anything, mock.Anything, mock.Anything).Return(&collogpb.ExportLogsServiceResponse{
+					PartialSuccess: &collogpb.ExportLogsPartialSuccess{
+						RejectedLogRecords: 3,
+					},
+				}, status.Errorf(codes.InvalidArgument, "invalid argument"))
+			},
+			assertExportedValue: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runTestUploadLogs(t, tt.uploadLogsNum, tt.mockOnFunc, tt.assertExportedValue)
+		})
+	}
 }

@@ -154,6 +154,10 @@ func (c *client) UploadLogs(ctx context.Context, rl []*logpb.ResourceLogs) (err 
 		}()
 	}
 
+	defer func() {
+		otel.Handle(fmt.Errorf("--------------- success: %d, failed: %d", success, int64(len(rl))-success))
+	}()
+
 	return c.requestFunc(ctx, func(ctx context.Context) error {
 		resp, err := c.lsc.Export(ctx, &collogpb.ExportLogsServiceRequest{
 			ResourceLogs: rl,
